@@ -39,6 +39,7 @@ target_link_libraries(poisson_mesh_node
 )
 
 file(GLOB_RECURSE SCRIPT_FILES
+  CONFIGURE_DEPENDS
   RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
   "scripts/*.py"
   "scripts/*.sh"

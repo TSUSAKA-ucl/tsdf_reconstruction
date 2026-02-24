@@ -9,6 +9,7 @@ from std_srvs.srv import Trigger
 import sensor_msgs_py.point_cloud2 as pc2
 import numpy as np
 from collections import deque
+from cv_bridge import CvBridge
 
 class CloudAverager(Node):
     def __init__(self):
@@ -23,6 +24,11 @@ class CloudAverager(Node):
             PointCloud2, '/camera/camera/depth/color/points', self.callback, 10)
         self.pub = self.create_publisher(PointCloud2, '~/averaged_cloud', 10)
         
+        self.bridge = CvBridge()
+        self.last_depth_msg = None
+        self.last_filtered_depth_img = None
+        self.image_buffer = deque()
+
         self.buffer = deque() # 点群データを貯めるキュー
         self.get_logger().info('Cloud Averager Node Started.')
         # 1. リセットサービスの作成
@@ -38,7 +44,7 @@ class CloudAverager(Node):
 
     def save_callback(self, request, response):
         """現在の平均化済みデータをPLYとして保存する"""
-        if self.last_filtered_xyz is None or len(self.last_filtered_xyz) == 0:
+        if self.last_filtered_xyz is None or len(self.last_filtered_xyz) == 0 or self.last_filtered_depth_img is None:
             response.success = False
             response.message = "No averaged data available to save."
             return response
@@ -55,17 +61,22 @@ class CloudAverager(Node):
             b = (rgb_ints & 0xFF) / 255.0
             pcd.colors = o3d.utility.Vector3dVector(np.stack([r, g, b], axis=1))
 
+            ts = self.get_clock().now().nanoseconds
             # 保存ファイル名の生成 (タイムスタンプ付き)
-            filename = f"averaged_cloud_{self.get_clock().now().nanoseconds}.ply"
+            filename = f"averaged_cloud_{ts}.ply"
             o3d.io.write_point_cloud(filename, pcd, write_ascii=False)
             
+            depth_filename = f"averaged_depth_{ts}.png"
+            depth_mm = (self.last_filtered_depth_img * 1000).astype(np.uint16)
+            cv2.imwrite(depth_filename, depth_mm)
+
             response.success = True
-            response.message = f"Saved successfully as: {os.path.abspath(filename)}"
+            response.message = f"Saved successfully as: {os.path.abspath(filename)} and {os.path.abspath(depth_filename)}"
             self.get_logger().info(response.message)
             
         except Exception as e:
             response.success = False
-            response.message = f"Failed to save PLY: {str(e)}"
+            response.message = f"Failed to save PLY or depth image: {str(e)}"
             
         return response
 
@@ -92,6 +103,27 @@ class CloudAverager(Node):
         z_min = self.get_parameter('z_min').value
         z_max = self.get_parameter('z_max').value
         
+        gen = pc2.read_points(msg, field_names=['x', 'y', 'z', 'rgb'], skip_nans=False)
+        w, h = msg.width, msg.height
+        # (h, w, 3) の配列に変換
+        curr_xyz = np.fromiter(gen, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('rgb', 'f4')])
+        curr_z = curr_xyz['z'].reshape((h, w))
+        curr_full_xyz = np.stack([curr_xyz['x'], curr_xyz['y'], curr_xyz['z']], axis=1).reshape((h, w, 3))
+        # 平均化処理
+        self.image_buffer.append(curr_z)
+        if len(self.image_buffer) > avg_count:
+            self.image_buffer.popleft()
+
+        if len(self.image_buffer) == avg_count:
+            stacked_imgs = np.array(self.image_buffer)  # (Frames, H, W)
+            stacked_imgs[stacked_imgs == 0] = np.nan  # 0をNaNに置換
+            avg_depth_img = np.nanmean(stacked_imgs, axis=0)
+            std_z = np.nanstd(stacked_imgs[:,:,:,2], axis=0)
+            mask = (std_z < 0.02) & \
+                   (avg_depth_img > z_min) & \
+                     (avg_depth_img < z_max)
+                   
+
         # 1. PointCloud2 を読み込み (NaNや0を含めて保持)
         gen = pc2.read_points(msg, field_names=['x', 'y', 'z', 'rgb'], skip_nans=False)
         data = np.fromiter(gen, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('rgb', 'f4')])
