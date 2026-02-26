@@ -6,12 +6,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 1. 依存パッケージの探索
+find_package(PCL REQUIRED COMPONENTS common io filters features surface search)
+
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED) # これで include/pcl_conversions へのパスが通るはず
-find_package(PCL REQUIRED COMPONENTS common io filters features surface search)
 
 # 2. 実行ファイルの作成
 add_executable(poisson_mesh_node src/poisson_mesh_node.cpp src/main.cpp)

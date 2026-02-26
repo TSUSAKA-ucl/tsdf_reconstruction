@@ -7,7 +7,9 @@ import message_filters
 import open3d as o3d
 import open3d.core as o3c
 import numpy as np
-import copy
+import h5py
+from pathlib import Path
+from datetime import datetime
 
 device = o3c.Device("CUDA:0")
 devcpu = o3c.Device("CPU:0")
@@ -23,18 +25,21 @@ cx = 629.7527465820312
 cy = 356.7699890136719
 
 
+
+
 class TSDFIntegrator(Node):
     def __init__(self):
         super().__init__('tsdf_integrator')
         
         # VoxelBlockGridの初期化
         self.voxel_size = 0.005  # 5mm
+        self.block_resolution = 16  # 16^3 voxels per block
         self.vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=('tsdf', 'weight', 'color'),
             attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
             attr_channels=((1), (1), (3)),
             voxel_size=self.voxel_size,
-            block_resolution=16,   # 16^3 voxels per block
+            block_resolution=self.block_resolution,
             block_count=10000,
             device=device
         )
@@ -77,92 +82,122 @@ class TSDFIntegrator(Node):
         self.vbg.integrate(frustum_block_coords, depth_t, color_t, 
                            self.intrinsic_t, self.extrinsic_t, depth_scale=1000.0, depth_max=1.5)
 
-    def save_mesh(self):
+    def save_mesh(self, filename: str = "integrated_mesh.ply"):
         # 結果をメッシュとして抽出
         mesh = self.vbg.extract_triangle_mesh()
         legacy_mesh = mesh.to_legacy()
-        o3d.io.write_triangle_mesh("integrated_mesh_tensor.ply", legacy_mesh)
-
-    def create_safe_thick_pcd(self, thickness=0.05):
-        device = self.vbg.hashmap().device
-        # voxel_size = self.vbg.get_voxel_size()
-        voxel_size = self.voxel_size
-        # 1. 表面のメッシュを抽出 (Tensor版)
-        mesh = self.vbg.extract_triangle_mesh()
-        if len(mesh.vertex.positions) == 0:
-            return None
-        vertices = mesh.vertex.positions # [N, 3] Tensor
-        normals = mesh.vertex.normals    # [N, 3] Tensor
-        # 2. 裏面候補点の計算 (P' = P - n * d)
-        offset_points = vertices - normals * thickness
-
-        # 2. 3D座標を「ボクセル整数座標」に変換
-        # 座標を voxel_size で割って整数（Int32）にする
-        voxel_coords = (offset_points / voxel_size).floor().to(o3c.int32)
-    
-        # 3. ハッシュマップからインデックスを取得
-        # vbg.hashmap() は T-Hashmap オブジェクトを返します
-        # find メソッドは、[N, 3] の座標に対し、[N] のインデックスと [N] のマスクを返します
-        buf_indices, masks = self.vbg.hashmap().find(voxel_coords)
-    
-        # 3. 属性（TSDF, Weight）の取得
-        # self.vbg.attribute("tsdf") は全ての有効ボクセルのTSDF値を持つ巨大な1次元Tensor
-        tsdf_all = self.vbg.attribute("tsdf")
-        weight_all = self.vbg.attribute("weight")
-        
-        # 4. クエリした座標に対応する値を抽出
-        # mask はその座標にボクセルが存在するかどうかの真偽値
-        # buf_indices はそのボクセルが属性Tensorの何番目にあるかのインデックス
-        q_tsdf = o3c.Tensor(np.zeros(len(offset_points), dtype=np.float32), device=device)
-        q_weight = o3c.Tensor(np.zeros(len(offset_points), dtype=np.float32), device=device)
-    
-        # 有効な（ボクセルが存在する）場所だけ値をコピー
-        q_tsdf[masks] = tsdf_all[buf_indices[masks]].reshape((-1,))
-        q_weight[masks] = weight_all[buf_indices[masks]].reshape((-1,))
-
-        # 5. 安全判定 (空洞でない場所 = 重みが0、またはTSDFが0以下)
-        # 条件: 重みが0 (未知) または TSDFが0以下 (内部/裏側)
-        # つまり「(TSDF > 0 かつ Weight > 0) ではない」場所
-        is_free_space = (q_tsdf > 0) & (q_weight > 0)
-        safe_mask = is_free_space.reshape(-1).logical_not()
-    
-        # マスクを適用して安全な裏面頂点のみ抽出
-        safe_offset_points = offset_points[safe_mask]
-    
-        # 5. 表面と（安全な）裏面を統合した点群を作成
-        # combined_points = o3c.Tensor.concatenate([vertices, safe_offset_points], axis=0)
-        # o3c.Tensor.concatenate ではなく、o3c.concatenate を使用
-        combined_points = o3c.concatenate([vertices, safe_offset_points], axis=0)
-
-
-        pcd = o3d.t.geometry.PointCloud(device)
-        pcd.point.positions = combined_points
-        return pcd
-
-    def alpha_shape(self, pcd, alpha=0.08):
-        pcd_legacy = pcd.to_legacy()
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd_legacy, alpha)
-
-        triangle_clusters, cluster_n_triangles, cluster_area = mesh.cluster_connected_triangles()
-
-        for i in range(len(cluster_n_triangles)):
-            component_mask = np.array(triangle_clusters) == i
-            component_mesh = copy.deepcopy(mesh)
-            component_mesh.remove_triangles_by_mask(~component_mask)
-            component_mesh.remove_unreferenced_vertices()
-            print(f"Component {i}: {cluster_n_triangles[i]} triangles, area: {cluster_area[i]:.4f}")
-            if cluster_n_triangles[i] > 7:
-                o3d.io.write_triangle_mesh(f"component_{i}.ply", component_mesh)
+        o3d.io.write_triangle_mesh(filename, legacy_mesh)
 
     def save_mesh_callback(self, request, response):
-        self.save_mesh()
-        pcd = self.create_safe_thick_pcd(thickness=0.05)
-        if pcd is not None:
-            o3d.io.write_point_cloud("safe_thick_pcd.ply", pcd.to_legacy())
-            self.alpha_shape(pcd, alpha=0.08)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.save_mesh(f"tsdf_mesh_{timestamp}.ply")
+        self.save_vbg_dense_aabb(
+            self.vbg, 
+            aabb_min=[-1.0, -1.0, -1.0], 
+            aabb_max=[1.0, 1.0, 1.0], 
+            filename=f"tsdf_dense_{timestamp}.h5"
+        )
+        rclpy.logging.get_logger('TSDFIntegrator').info("Mesh and dense grid saved.")
         response.success = True
         response.message = "Mesh saved successfully."
         return response
+
+
+    def save_vbg_dense_aabb(self,
+                            vbg: o3d.t.geometry.VoxelBlockGrid,
+                            aabb_min,
+                            aabb_max,
+                            filename: str):
+
+        # voxel_size = vbg.voxel_size
+        voxel_size = self.voxel_size
+        # block_res = vbg.block_resolution
+        block_res = self.block_resolution
+        block_size = voxel_size * block_res
+
+        aabb_min = np.array(aabb_min, dtype=np.float32)
+        aabb_max = np.array(aabb_max, dtype=np.float32)
+
+        # --- 1. world → voxel index ---
+        min_idx = np.floor(aabb_min / voxel_size).astype(np.int32)
+        max_idx = np.ceil(aabb_max / voxel_size).astype(np.int32)
+
+        grid_dim = max_idx - min_idx
+
+        nx, ny, nz = grid_dim.tolist()
+
+        print(f"Dense grid size: {nx} x {ny} x {nz}")
+
+        # --- 2. dense配列確保 ---
+        tsdf_dense = np.ones((nx, ny, nz), dtype=np.float32)
+        weight_dense = np.zeros((nx, ny, nz), dtype=np.float32)
+        color_dense = np.zeros((nx, ny, nz, 3), dtype=np.float32)
+
+        # --- 3. active block取得 ---
+        hashmap = vbg.hashmap()
+        active_keys = hashmap.key_tensor().cpu().numpy()
+        active_indices = hashmap.active_buf_indices().cpu()
+
+        # attributes
+        tsdf_attr = vbg.attribute("tsdf")
+        weight_attr = vbg.attribute("weight")
+        color_attr = vbg.attribute("color")
+
+        for block_idx, buf_idx in zip(active_keys, active_indices):
+
+            block_origin = block_idx * block_size
+
+            buf_idx = buf_idx.item()  # Tensorからスカラーに変換
+            # block内voxelを取得
+            tsdf_block = tsdf_attr[buf_idx].reshape(
+                (block_res, block_res, block_res)
+            ).cpu().numpy()
+
+            weight_block = weight_attr[buf_idx].reshape(
+                (block_res, block_res, block_res)
+            ).cpu().numpy()
+
+            color_block = color_attr[buf_idx].reshape(
+                (block_res, block_res, block_res, 3)
+            ).cpu().numpy()
+
+            # --- 4. block内各voxelをworld indexへ ---
+            for ix in range(block_res):
+                for iy in range(block_res):
+                    for iz in range(block_res):
+
+                        global_voxel = (
+                            block_idx * block_res
+                            + np.array([ix, iy, iz])
+                        )
+
+                        dense_idx = global_voxel - min_idx
+
+                        dx, dy, dz = dense_idx
+
+                        if (0 <= dx < nx and
+                            0 <= dy < ny and
+                            0 <= dz < nz):
+
+                            tsdf_dense[dx, dy, dz] = tsdf_block[ix, iy, iz]
+                            weight_dense[dx, dy, dz] = weight_block[ix, iy, iz]
+                            color_dense[dx, dy, dz] = color_block[ix, iy, iz]
+
+        # --- 5. 保存 ---
+        filename = Path(filename)
+        filename.parent.mkdir(parents=True, exist_ok=True)
+
+        with h5py.File(filename, "w") as f:
+            f.create_dataset("tsdf", data=tsdf_dense, compression="gzip")
+            f.create_dataset("weight", data=weight_dense, compression="gzip")
+            f.create_dataset("color", data=color_dense, compression="gzip")
+
+            f.attrs["voxel_size"] = voxel_size
+            f.attrs["aabb_min"] = aabb_min
+            f.attrs["aabb_max"] = aabb_max
+
+        print(f"Saved to {filename}")
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -170,14 +205,9 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.save_mesh()
-        pcd = node.create_safe_thick_pcd(thickness=0.05)
-        if pcd is not None:
-            o3d.io.write_point_cloud("safe_thick_pcd.ply", pcd.to_legacy())
-            node.alpha_shape(pcd, alpha=0.08)
-    finally:
+        # node.get_logger().info("Shutting down TSDF Node...")
         node.destroy_node()
-        rclpy.shutdown()
+        # rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
