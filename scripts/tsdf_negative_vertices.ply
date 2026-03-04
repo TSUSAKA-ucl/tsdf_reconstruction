@@ -1,0 +1,70 @@
+#! /usr/bin/env python3
+import h5py
+import numpy as np
+import open3d as o3d
+import time
+import os
+import sys
+
+# filename = "tsdf_snapshot.h5"  # ←変更
+filename = sys.argv[1] if len(sys.argv) > 1 else "tsdf_snapshot.h5"
+output_name = os.path.splitext(os.path.basename(filename))[0]
+# output_ply = "tsdf_negative_points.ply"
+output_ply = f"{output_name}_negative_points.ply"
+
+start_total = time.time()
+
+# ----------------------------
+# 1. Load HDF5
+# ----------------------------
+with h5py.File(filename, "r") as f:
+    tsdf = f["tsdf"][:]
+    weight = f["weight"][:]
+    color = f["color"][:]
+    voxel_size = f.attrs["voxel_size"]
+    aabb_min = f.attrs["aabb_min"]
+
+print("Loaded")
+
+# ----------------------------
+# 2. Mask (observed & negative)
+# ----------------------------
+mask = (weight > 0) & (tsdf < 0)
+
+indices = np.argwhere(mask)
+
+print("Negative observed voxels:", len(indices))
+
+if len(indices) == 0:
+    print("No negative voxels found.")
+    exit()
+
+# ----------------------------
+# 3. Convert voxel index → world coordinate
+# voxel center position
+# ----------------------------
+# world = aabb_min + (idx + 0.5) * voxel_size
+points = aabb_min + (indices + 0.5) * voxel_size
+
+# ----------------------------
+# 4. Extract color
+# ----------------------------
+colors = color[mask]
+
+# Open3Dは0-1範囲を期待
+colors = np.clip(colors, 0.0, 1.0)
+
+# ----------------------------
+# 5. Create point cloud
+# ----------------------------
+pcd = o3d.geometry.PointCloud()
+pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+
+# ----------------------------
+# 6. Save PLY
+# ----------------------------
+o3d.io.write_point_cloud(output_ply, pcd)
+
+print("Saved:", output_ply)
+print("Total elapsed:", time.time() - start_total, "sec")

@@ -93,8 +93,8 @@ class TSDFIntegrator(Node):
         self.save_mesh(f"tsdf_mesh_{timestamp}.ply")
         self.save_vbg_dense_aabb(
             self.vbg, 
-            aabb_min=[-1.0, -1.0, -1.0], 
-            aabb_max=[1.0, 1.0, 1.0], 
+            aabb_min=[-1.0, -1.0, 0.0], 
+            aabb_max=[1.0, 1.0, 2.0], 
             filename=f"tsdf_dense_{timestamp}.h5"
         )
         rclpy.logging.get_logger('TSDFIntegrator').info("Mesh and dense grid saved.")
@@ -144,7 +144,6 @@ class TSDFIntegrator(Node):
         color_attr = vbg.attribute("color")
 
         for block_idx, buf_idx in zip(active_keys, active_indices):
-
             block_origin = block_idx * block_size
 
             buf_idx = buf_idx.item()  # Tensorからスカラーに変換
@@ -152,36 +151,61 @@ class TSDFIntegrator(Node):
             tsdf_block = tsdf_attr[buf_idx].reshape(
                 (block_res, block_res, block_res)
             ).cpu().numpy()
+            tsdf_block = np.transpose(tsdf_block, (2, 1, 0))  # (block_res, block_res, block_res) → (z,y,x)順に並び替え
 
             weight_block = weight_attr[buf_idx].reshape(
                 (block_res, block_res, block_res)
             ).cpu().numpy()
+            weight_block = np.transpose(weight_block, (2, 1, 0))  # (block_res, block_res, block_res) → (z,y,x)順に並び替え
 
             color_block = color_attr[buf_idx].reshape(
                 (block_res, block_res, block_res, 3)
             ).cpu().numpy()
+            color_block = np.transpose(color_block, (2, 1, 0, 3))  # (block_res, block_res, block_res, 3) → (z,y,x,3)順に並び替え
 
-            # --- 4. block内各voxelをworld indexへ ---
-            for ix in range(block_res):
-                for iy in range(block_res):
-                    for iz in range(block_res):
+            # block_idx は block の 3D index（例: [bx, by, bz]）
+            # --- block の world voxel index 範囲 ---
+            block_start = block_idx * block_res           # (3,)
+            block_end   = block_start + block_res         # (3,)
 
-                        global_voxel = (
-                            block_idx * block_res
-                            + np.array([ix, iy, iz])
-                        )
+            # --- dense グリッド内 index 範囲に変換 ---
+            dense_start = block_start - min_idx
+            dense_end   = block_end   - min_idx
 
-                        dense_idx = global_voxel - min_idx
+            # 範囲を展開
+            x0, y0, z0 = dense_start
+            x1, y1, z1 = dense_end
 
-                        dx, dy, dz = dense_idx
+            # --- AABB外に出る場合をクリップ ---
+            xs0 = max(x0, 0)
+            ys0 = max(y0, 0)
+            zs0 = max(z0, 0)
 
-                        if (0 <= dx < nx and
-                            0 <= dy < ny and
-                            0 <= dz < nz):
+            xs1 = min(x1, nx)
+            ys1 = min(y1, ny)
+            zs1 = min(z1, nz)
+            # 何も重ならないならスキップ
+            if xs0 >= xs1 or ys0 >= ys1 or zs0 >= zs1:
+                continue
 
-                            tsdf_dense[dx, dy, dz] = tsdf_block[ix, iy, iz]
-                            weight_dense[dx, dy, dz] = weight_block[ix, iy, iz]
-                            color_dense[dx, dy, dz] = color_block[ix, iy, iz]
+            # --- block側も対応してスライス ---
+            bx0 = xs0 - x0
+            by0 = ys0 - y0
+            bz0 = zs0 - z0
+
+            bx1 = bx0 + (xs1 - xs0)
+            by1 = by0 + (ys1 - ys0)
+            bz1 = bz0 + (zs1 - zs0)
+
+            # --- スライスコピー ---
+            tsdf_dense[xs0:xs1, ys0:ys1, zs0:zs1] = \
+                tsdf_block[bx0:bx1, by0:by1, bz0:bz1]
+
+            weight_dense[xs0:xs1, ys0:ys1, zs0:zs1] = \
+                weight_block[bx0:bx1, by0:by1, bz0:bz1]
+            
+            color_dense[xs0:xs1, ys0:ys1, zs0:zs1] = \
+                color_block[bx0:bx1, by0:by1, bz0:bz1]
 
         # --- 5. 保存 ---
         filename = Path(filename)
